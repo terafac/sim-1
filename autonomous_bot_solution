@@ -1,0 +1,187 @@
+
+this will be the file path 
+autonomous_bot_solution/
+│── src/
+│   ├── agent.py
+│   ├── vision.py
+│   └── experiment_speed_vs_collisions.py
+│── scripts/
+│   ├── run_level1.sh
+│   ├── run_level2.sh
+│── README.md
+│── requirements.txt
+
+
+vision.py 
+import cv2
+import numpy as np
+
+class Vision:
+    def __init__(self):
+        # HSV ranges for colors
+        self.goal_lower = np.array([80, 150, 150])   # Cyan goal
+        self.goal_upper = np.array([100, 255, 255])
+        self.obst_lower = np.array([40, 50, 50])     # Green obstacles
+        self.obst_upper = np.array([80, 255, 255])
+
+    def process(self, frame):
+        """Detect goal and obstacles in frame."""
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+        # Goal mask
+        goal_mask = cv2.inRange(hsv, self.goal_lower, self.goal_upper)
+        goal_cnts, _ = cv2.findContours(goal_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        # Obstacle mask
+        obst_mask = cv2.inRange(hsv, self.obst_lower, self.obst_upper)
+        obst_cnts, _ = cv2.findContours(obst_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        goal_center = None
+        if goal_cnts:
+            c = max(goal_cnts, key=cv2.contourArea)
+            M = cv2.moments(c)
+            if M["m00"] > 0:
+                goal_center = (int(M["m10"]/M["m00"]), int(M["m01"]/M["m00"]))
+
+        obst_boxes = [cv2.boundingRect(c) for c in obst_cnts]
+
+        return goal_center, obst_boxes
+
+
+
+
+src/agent.py
+
+import cv2
+import requests
+import websocket
+import json
+import threading
+from src.vision import Vision
+
+SERVER_URL = "http://localhost:5000"
+WS_URL = "ws://localhost:8080"
+
+class Agent:
+    def __init__(self, level=1):
+        self.level = level
+        self.vision = Vision()
+        self.ws = None
+        self.collision_count = 0
+        self.running = True
+
+    def connect_ws(self):
+        def on_message(ws, message):
+            data = json.loads(message)
+            if "collision" in data:
+                self.collision_count += 1
+                print(f"[⚠️ Collision] Total = {self.collision_count}")
+
+        self.ws = websocket.WebSocketApp(
+            WS_URL,
+            on_message=on_message
+        )
+        thread = threading.Thread(target=self.ws.run_forever, daemon=True)
+        thread.start()
+
+    def get_frame(self):
+        """Get camera frame from server."""
+        resp = requests.get(f"{SERVER_URL}/camera/frame")
+        arr = bytearray(resp.content)
+        frame = cv2.imdecode(
+            np.frombuffer(arr, dtype=np.uint8), cv2.IMREAD_COLOR
+        )
+        return frame
+
+    def send_action(self, action):
+        """Send movement command to server."""
+        requests.post(f"{SERVER_URL}/bot/action", json={"action": action})
+
+    def run(self):
+        self.connect_ws()
+        print(f"[🤖 Agent] Running on Level {self.level}...")
+
+        while self.running:
+            frame = self.get_frame()
+            if frame is None:
+                continue
+
+            goal, obstacles = self.vision.process(frame)
+
+            action = "forward"
+            if goal:
+                if goal[0] < frame.shape[1] // 3:
+                    action = "left"
+                elif goal[0] > 2 * frame.shape[1] // 3:
+                    action = "right"
+                else:
+                    action = "forward"
+
+            # crude avoidance
+            for (x, y, w, h) in obstacles:
+                if y + h > frame.shape[0] // 2:
+                    action = "right"
+
+            self.send_action(action)
+
+    def stop(self):
+        self.running = False
+        if self.ws:
+            self.ws.close()
+
+
+if __name__ == "__main__":
+    agent = Agent(level=1)
+    try:
+        agent.run()
+    except KeyboardInterrupt:
+        agent.stop()
+        print("[🛑 Agent stopped]")
+
+
+
+
+      src/  experiment_speed_vs_collisions.py
+import time
+import matplotlib.pyplot as plt
+from src.agent import Agent
+
+def run_experiment(level=1, duration=30):
+    agent = Agent(level=level)
+    agent.connect_ws()
+
+    print(f"[🧪 Experiment] Running for {duration}s on level {level}")
+    start = time.time()
+    agent.running = True
+
+    try:
+        while time.time() - start < duration:
+            agent.run()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        agent.stop()
+
+    print(f"[📊 Result] Collisions: {agent.collision_count}")
+    return agent.collision_count
+
+
+def compare_speeds():
+    durations = [10, 20, 30, 40]
+    collisions = []
+
+    for d in durations:
+        c = run_experiment(level=1, duration=d)
+        collisions.append(c)
+
+    plt.plot(durations, collisions, marker='o')
+    plt.title("Experiment: Duration vs Collisions")
+    plt.xlabel("Duration (s)")
+    plt.ylabel("Collisions")
+    plt.savefig("results.png")
+    plt.show()
+
+
+if __name__ == "__main__":
+    compare_speeds()
+      
